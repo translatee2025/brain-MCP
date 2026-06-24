@@ -48,10 +48,18 @@ saves back as a new version, version history with one-click restore, and
 download buttons for a single `.md`, the whole brain as `.zip`, or the raw
 `brain.db`. Port = `BRAIN_UI_PORT` (default 4319).
 
-## Install
+## Install (one-click, recommended)
+
+Download the latest `brain-mcp.mcpb` from
+[Releases](https://github.com/translatee2025/brain-MCP/releases) and
+double-click it. Claude Desktop installs the extension and lets you configure
+the optional restructure engine from a settings dialog. No terminal needed.
+
+## Install (manual, from source)
 
 ```
-cd brain-mcp
+git clone https://github.com/translatee2025/brain-MCP.git
+cd brain-MCP
 npm install
 npm run build
 ```

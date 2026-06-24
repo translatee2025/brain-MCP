@@ -1,0 +1,123 @@
+{
+  "manifest_version": "0.4",
+  "name": "brain-mcp",
+  "display_name": "Brain",
+  "version": "0.1.0",
+  "description": "A private local long-term memory for Claude. Save, search, version and browse clean markdown notes in your own SQLite store; never leaves your Mac unless you opt in.",
+  "long_description": "Brain gives Claude a persistent personal knowledge base that lives entirely on your machine. Claude writes clean notes (manually with 'save to brain' or automatically once a conversation crosses ~10 pages), stores them in a local SQLite database with FTS5 full-text search, keeps version history, and exposes a localhost web UI so you can browse, edit and export your notes as markdown. No telemetry, no cloud, no account. Optional restructuring engines (host model via MCP sampling, or any OpenAI-compatible endpoint including local Ollama) can be enabled per-user.",
+  "author": {
+    "name": "translatee2025",
+    "url": "https://github.com/translatee2025"
+  },
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/translatee2025/brain-MCP.git"
+  },
+  "homepage": "https://github.com/translatee2025/brain-MCP",
+  "documentation": "https://github.com/translatee2025/brain-MCP/blob/main/README.md",
+  "support": "https://github.com/translatee2025/brain-MCP/issues",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "notes",
+    "knowledge-base",
+    "long-term-memory",
+    "sqlite",
+    "fts5",
+    "markdown",
+    "local-first",
+    "private"
+  ],
+  "privacy_policies": [
+    "https://github.com/translatee2025/brain-MCP/blob/main/PRIVACY.md"
+  ],
+  "compatibility": {
+    "platforms": ["darwin"],
+    "runtimes": { "node": ">=20.0.0" }
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "BRAIN_DIR": "${user_config.brain_dir}",
+        "BRAIN_RESTRUCTURE": "${user_config.restructure_mode}",
+        "BRAIN_LLM_BASE_URL": "${user_config.llm_base_url}",
+        "BRAIN_LLM_API_KEY": "${user_config.llm_api_key}",
+        "BRAIN_LLM_MODEL": "${user_config.llm_model}",
+        "BRAIN_FLUSH_TOKENS": "${user_config.flush_tokens}",
+        "BRAIN_UI_PORT": "${user_config.ui_port}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "brain_save", "description": "Save a clean markdown note to long-term memory with a title, optional folder and tags." },
+    { "name": "brain_search", "description": "Full-text search (SQLite FTS5, bm25 ranked) across saved notes, returns highlighted snippets." },
+    { "name": "brain_get", "description": "Fetch one note in full by its id, including title, folder, tags and full body." },
+    { "name": "brain_list", "description": "List recent notes with folder counts; optionally filter by folder." },
+    { "name": "brain_delete", "description": "Soft-delete a note by id; kept in the database but dropped from search and listings." },
+    { "name": "brain_versions", "description": "List the version history of a note, newest first." },
+    { "name": "brain_restore", "description": "Restore a note to an earlier version; the current state is snapshotted first so nothing is lost." },
+    { "name": "brain_capture", "description": "Append the latest exchange to a per-session running buffer and report a token estimate; signals should_flush=true once the buffer crosses the auto-save threshold." },
+    { "name": "brain_flush", "description": "Restructure the running buffer into one clean note, save it, and clear the buffer. Use when the user says 'save to brain' or capture reports should_flush." },
+    { "name": "brain_export", "description": "Export the whole brain as a zip with folder-structured markdown files plus an index and metadata." },
+    { "name": "brain_open_ui", "description": "Open the local web viewer in the default browser to browse, read, edit, restore versions of, and download notes." },
+    { "name": "brain_system_check", "description": "Report this machine's RAM and CPU and recommend a local model plus exact setup steps for offline restructuring." }
+  ],
+  "user_config": {
+    "restructure_mode": {
+      "type": "string",
+      "title": "Restructure engine",
+      "description": "How notes are cleaned up before saving. 'none' stores exactly what was written (recommended). 'sampling' asks the host's own model via MCP sampling. 'openai' uses the OpenAI-compatible endpoint configured below.",
+      "default": "none",
+      "required": false
+    },
+    "brain_dir": {
+      "type": "directory",
+      "title": "Storage directory",
+      "description": "Where the brain.db SQLite file and exports are stored. Leave blank for ~/.brain.",
+      "required": false
+    },
+    "flush_tokens": {
+      "type": "number",
+      "title": "Auto-save threshold (tokens)",
+      "description": "Capture buffer size (in tokens) that triggers should_flush. ~6000 tokens is roughly 10 pages.",
+      "default": 6000,
+      "min": 500,
+      "max": 32000,
+      "required": false
+    },
+    "ui_port": {
+      "type": "number",
+      "title": "Web viewer port",
+      "description": "Localhost port for the built-in browser UI.",
+      "default": 4319,
+      "min": 1024,
+      "max": 65535,
+      "required": false
+    },
+    "llm_base_url": {
+      "type": "string",
+      "title": "LLM base URL (openai mode)",
+      "description": "OpenAI-compatible /v1 endpoint. Use https://api.openai.com/v1 for OpenAI, http://127.0.0.1:11434/v1 for Ollama, http://127.0.0.1:1234/v1 for LM Studio.",
+      "required": false
+    },
+    "llm_api_key": {
+      "type": "string",
+      "title": "LLM API key (openai mode)",
+      "description": "Leave blank for local servers (Ollama, LM Studio).",
+      "sensitive": true,
+      "required": false
+    },
+    "llm_model": {
+      "type": "string",
+      "title": "LLM model (openai mode)",
+      "description": "Model id, e.g. gpt-4o-mini, or the local model you pulled in Ollama.",
+      "default": "gpt-4o-mini",
+      "required": false
+    }
+  }
+}
