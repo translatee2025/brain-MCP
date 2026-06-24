@@ -4,3 +4,8 @@ dist/
 .DS_Store
 .brain/
 *.mcpb
+
+# tooling artifacts from local AI assistants
+.claude/
+CLAUDE.md
+graphify-out/
