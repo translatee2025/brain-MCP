@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createReadStream } from "node:fs";
-import { marked } from "marked";
+import { randomBytes } from "node:crypto";
+import { Marked } from "marked";
 import {
   listDocs,
   listFolders,
@@ -17,15 +18,27 @@ import { exportZipBuffer } from "./export.js";
 
 let server: http.Server | null = null;
 let boundPort = 0;
+let started = false;
 
-// Local single-user content, but a saved note could contain raw HTML.
-// Strip script/iframe and inline event handlers before rendering.
-function renderMd(md: string): string {
-  const html = marked.parse(md, { async: false }) as string;
+// Per-launch secret. The opened URL carries ?t=<TOKEN>; every /api and
+// /download request must present it. A website that re-binds DNS to 127.0.0.1
+// (the classic loopback attack) still does not know this token, and the Host
+// check below rejects it regardless.
+const TOKEN = randomBytes(24).toString("hex");
+
+// Drop raw HTML at render time (defense in depth alongside the CSP). Markdown
+// syntax still renders; embedded <script>/<svg onload>/etc. are removed.
+const md = new Marked();
+md.use({ renderer: { html: () => "" } });
+
+function renderMd(markdown: string): string {
+  const html = md.parse(markdown, { async: false }) as string;
+  // Belt-and-suspenders: strip anything that slipped through. The real
+  // guarantee is the nonce CSP (no inline/script execution) on the response.
   return html
-    .replace(/<\s*(script|iframe|object|embed)[\s\S]*?<\/\s*\1\s*>/gi, "")
+    .replace(/<\s*(script|iframe|object|embed|link|meta)\b[\s\S]*?(?:<\/\s*\1\s*>|>)/gi, "")
     .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/javascript:/gi, "");
+    .replace(/(href|src)\s*=\s*("|')?\s*javascript:[^"'\s>]*/gi, "$1=#");
 }
 
 function json(res: http.ServerResponse, code: number, body: unknown) {
@@ -33,13 +46,19 @@ function json(res: http.ServerResponse, code: number, body: unknown) {
   res.writeHead(code, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(s),
+    "cache-control": "no-store",
   });
   res.end(s);
 }
 
-async function readBody(req: http.IncomingMessage): Promise<any> {
+async function readBody(req: http.IncomingMessage, maxBytes = 8 * 1024 * 1024): Promise<any> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  for await (const c of req) {
+    total += (c as Buffer).length;
+    if (total > maxBytes) throw new Error("request body too large");
+    chunks.push(c as Buffer);
+  }
   if (chunks.length === 0) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -48,8 +67,34 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
   }
 }
 
-const PAGE = `<!doctype html><html><head><meta charset="utf-8">
-<title>Brain</title><style>
+// Reject any request whose Host header is not our loopback origin. This is the
+// primary defense against DNS rebinding: a rebound request arrives with the
+// attacker's hostname in Host, which fails this check.
+function hostOk(req: http.IncomingMessage): boolean {
+  const host = (req.headers.host || "").toLowerCase();
+  return (
+    host === `127.0.0.1:${boundPort}` ||
+    host === `localhost:${boundPort}` ||
+    host === `[::1]:${boundPort}`
+  );
+}
+
+function originOk(req: http.IncomingMessage): boolean {
+  const o = req.headers.origin;
+  if (!o) return true; // top-level navigations (downloads) send no Origin
+  return (
+    o === `http://127.0.0.1:${boundPort}` ||
+    o === `http://localhost:${boundPort}` ||
+    o === `http://[::1]:${boundPort}`
+  );
+}
+
+function tokenOk(u: URL): boolean {
+  return u.searchParams.get("t") === TOKEN;
+}
+
+const PAGE = (nonce: string) => `<!doctype html><html><head><meta charset="utf-8">
+<title>Brain</title><style nonce="${nonce}">
 *{box-sizing:border-box}body{margin:0;font:14px/1.55 -apple-system,system-ui,sans-serif;color:#1c1c1e;background:#f5f5f7}
 #wrap{display:flex;height:100vh}
 #side{width:300px;border-right:1px solid #ddd;overflow:auto;background:#fff;display:flex;flex-direction:column}
@@ -77,76 +122,100 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8">
 </style></head><body><div id="wrap">
 <div id="side"><header>
 <input id="q" placeholder="Search...">
-<div class="top"><button onclick="dlAll()">Download .zip</button><button onclick="location='/download/db'">Download DB</button></div>
+<div class="top"><button id="dzip">Download .zip</button><button id="ddb">Download DB</button></div>
 </header><div id="list"></div></div>
 <div id="main"><div id="bar"></div><div id="meta"></div>
 <input id="etitle"><div id="view"></div><textarea id="edit"></textarea>
 <div id="vers"></div></div></div>
-<script>
+<script nonce="${nonce}">
+const T=new URLSearchParams(location.search).get('t')||'';
+const qs=p=>p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
 let cur=null,editing=false;
-async function load(){const r=await fetch('/api/docs');const d=await r.json();render(d)}
+async function load(){const d=await(await fetch(qs('/api/docs'))).json();render(d)}
 function render(d){const L=document.getElementById('list');L.innerHTML='';
  const by={};d.docs.forEach(x=>{(by[x.folder||'(root)']=by[x.folder||'(root)']||[]).push(x)});
  Object.keys(by).sort().forEach(f=>{const h=document.createElement('div');h.className='fold';h.textContent=f;L.appendChild(h);
   by[f].forEach(x=>{const e=document.createElement('div');e.className='doc'+(cur===x.id?' sel':'');
-   e.innerHTML='<div>'+esc(x.title)+'</div><small>'+(x.tags.join(' ')||'')+'</small>';
-   e.onclick=()=>open(x.id);L.appendChild(e)})})}
-function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-async function open(id){cur=id;editing=false;const r=await fetch('/api/doc/'+id);const d=await r.json();
+   const t=document.createElement('div');t.textContent=x.title;const s=document.createElement('small');s.textContent=x.tags.join(' ');
+   e.appendChild(t);e.appendChild(s);e.onclick=()=>open(x.id);L.appendChild(e)})})}
+async function open(id){cur=id;editing=false;const d=await(await fetch(qs('/api/doc/'+encodeURIComponent(id)))).json();
  document.getElementById('meta').textContent=(d.folder||'(root)')+'  ·  '+(d.tags.join(', ')||'no tags')+'  ·  v'+d.latest;
  document.getElementById('view').innerHTML=d.html;document.getElementById('view').style.display='block';
  document.getElementById('edit').style.display='none';document.getElementById('etitle').style.display='none';
  document.getElementById('edit').value=d.body_md;document.getElementById('etitle').value=d.title;
  bar(d);vers(d.versions);load()}
-function bar(d){document.getElementById('bar').innerHTML=
- '<button class="pri" onclick="toggle()">'+(editing?'View':'Edit')+'</button>'+
- (editing?'<button class="pri" onclick="save()">Save</button>':'')+
- '<button onclick="location=\\'/download/doc/'+d.id+'\\'">Download .md</button>'+
- '<button onclick="del(\\''+d.id+'\\')">Delete</button>'}
+function bar(d){const b=document.getElementById('bar');b.innerHTML='';
+ const mk=(label,cls,fn)=>{const x=document.createElement('button');x.textContent=label;if(cls)x.className=cls;x.onclick=fn;b.appendChild(x)};
+ mk(editing?'View':'Edit','pri',toggle);
+ if(editing)mk('Save','pri',save);
+ mk('Download .md',null,()=>{location=qs('/download/doc/'+encodeURIComponent(d.id))});
+ mk('Delete',null,()=>del(d.id))}
 function toggle(){editing=!editing;const v=document.getElementById('view'),e=document.getElementById('edit'),t=document.getElementById('etitle');
  v.style.display=editing?'none':'block';e.style.display=editing?'block':'none';t.style.display=editing?'block':'none';
- fetch('/api/doc/'+cur).then(r=>r.json()).then(bar)}
+ fetch(qs('/api/doc/'+encodeURIComponent(cur))).then(r=>r.json()).then(bar)}
 async function save(){const body=document.getElementById('edit').value,title=document.getElementById('etitle').value;
- await fetch('/api/doc/'+cur,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({title,body_md:body})});
+ await fetch(qs('/api/doc/'+encodeURIComponent(cur)),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({title,body_md:body})});
  editing=false;open(cur)}
-async function del(id){if(!confirm('Delete this note?'))return;await fetch('/api/doc/'+id,{method:'DELETE'});cur=null;
+async function del(id){if(!confirm('Delete this note?'))return;await fetch(qs('/api/doc/'+encodeURIComponent(id)),{method:'DELETE'});cur=null;
  document.getElementById('view').innerHTML='';document.getElementById('bar').innerHTML='';document.getElementById('vers').style.display='none';load()}
 function vers(vs){const V=document.getElementById('vers');if(!vs.length){V.style.display='none';return}
- V.style.display='block';V.innerHTML='<b>Version history</b>'+vs.map(v=>
- '<div class="vrow"><span>v'+v.version_n+' <span class="muted">'+v.changed_by+' · '+new Date(v.changed_at).toLocaleString()+'</span></span>'+
- '<button onclick="restore('+v.version_n+')">Restore</button></div>').join('')}
+ V.style.display='block';V.innerHTML='';const h=document.createElement('b');h.textContent='Version history';V.appendChild(h);
+ vs.forEach(v=>{const row=document.createElement('div');row.className='vrow';
+  const sp=document.createElement('span');sp.textContent='v'+v.version_n+' ('+v.changed_by+' · '+new Date(v.changed_at).toLocaleString()+')';
+  const btn=document.createElement('button');btn.textContent='Restore';btn.onclick=()=>restore(v.version_n);
+  row.appendChild(sp);row.appendChild(btn);V.appendChild(row)})}
 async function restore(n){if(!confirm('Restore v'+n+'? Current state is saved as a new version.'))return;
- await fetch('/api/doc/'+cur+'/restore',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version_n:n})});open(cur)}
-function dlAll(){location='/download/all'}
+ await fetch(qs('/api/doc/'+encodeURIComponent(cur)+'/restore'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version_n:n})});open(cur)}
+document.getElementById('dzip').onclick=()=>{location=qs('/download/all')};
+document.getElementById('ddb').onclick=()=>{location=qs('/download/db')};
 let t;document.getElementById('q').oninput=e=>{clearTimeout(t);t=setTimeout(async()=>{
  const v=e.target.value.trim();if(!v){load();return}
- const r=await fetch('/api/search?q='+encodeURIComponent(v));const d=await r.json();
+ const d=await(await fetch(qs('/api/search?q='+encodeURIComponent(v)))).json();
  const L=document.getElementById('list');L.innerHTML='';d.forEach(x=>{const el=document.createElement('div');
- el.className='doc';el.innerHTML='<div>'+esc(x.title)+'</div><small>'+esc(x.snippet)+'</small>';
- el.onclick=()=>open(x.id);L.appendChild(el)})},220)};
+ el.className='doc';const t=document.createElement('div');t.textContent=x.title;const s=document.createElement('small');s.textContent=x.snippet;
+ el.appendChild(t);el.appendChild(s);el.onclick=()=>open(x.id);L.appendChild(el)})},220)};
 load();
 </script></body></html>`;
 
 export function startUi(): { url: string; port: number } {
-  if (server && boundPort) {
-    return { url: `http://127.0.0.1:${boundPort}`, port: boundPort };
+  if (started && boundPort) {
+    return { url: `http://127.0.0.1:${boundPort}/?t=${TOKEN}`, port: boundPort };
   }
   const port = Number(process.env.BRAIN_UI_PORT ?? 4319);
+  boundPort = port;
 
   server = http.createServer(async (req, res) => {
     try {
-      const u = new URL(req.url ?? "/", "http://127.0.0.1");
+      // Every request must come from our own loopback origin.
+      if (!hostOk(req)) {
+        res.writeHead(403);
+        return res.end("forbidden");
+      }
+      const u = new URL(req.url ?? "/", `http://127.0.0.1:${boundPort}`);
       const p = u.pathname;
 
       if (p === "/" && req.method === "GET") {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        return res.end(PAGE);
-      }
-      if (p === "/api/docs") {
-        return json(res, 200, {
-          folders: listFolders(),
-          docs: listDocs(undefined, 500),
+        const nonce = randomBytes(16).toString("base64");
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy":
+            `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; ` +
+            `img-src 'self' data:; connect-src 'self'; form-action 'none'; base-uri 'none'`,
+          "cache-control": "no-store",
         });
+        return res.end(PAGE(nonce));
+      }
+
+      // All data routes require the per-launch token and a same-origin (or
+      // navigation) Origin.
+      const isApi = p.startsWith("/api/") || p.startsWith("/download/");
+      if (isApi && (!tokenOk(u) || !originOk(req))) {
+        res.writeHead(403);
+        return res.end("forbidden");
+      }
+
+      if (p === "/api/docs") {
+        return json(res, 200, { folders: listFolders(), docs: listDocs(undefined, 500) });
       }
       if (p === "/api/search") {
         return json(res, 200, search(u.searchParams.get("q") ?? "", undefined, 30));
@@ -159,25 +228,13 @@ export function startUi(): { url: string; port: number } {
           const d = getDoc(id);
           if (!d) return json(res, 404, { error: "not found" });
           const vs = listVersions(id);
-          return json(res, 200, {
-            ...d,
-            html: renderMd(d.body_md),
-            versions: vs,
-            latest: vs[0]?.version_n ?? 1,
-          });
+          return json(res, 200, { ...d, html: renderMd(d.body_md), versions: vs, latest: vs[0]?.version_n ?? 1 });
         }
         if (req.method === "PUT") {
           const b = await readBody(req);
           const d = getDoc(id);
           if (!d) return json(res, 404, { error: "not found" });
-          saveDoc({
-            id,
-            title: b.title ?? d.title,
-            folder: d.folder,
-            body_md: b.body_md ?? d.body_md,
-            tags: d.tags,
-            changedBy: "user_edit",
-          });
+          saveDoc({ id, title: b.title ?? d.title, folder: d.folder, body_md: b.body_md ?? d.body_md, tags: d.tags, changedBy: "user_edit" });
           return json(res, 200, { ok: true });
         }
         if (req.method === "DELETE") {
@@ -195,21 +252,14 @@ export function startUi(): { url: string; port: number } {
       m = p.match(/^\/download\/doc\/([^/]+)$/);
       if (m) {
         const id = decodeURIComponent(m[1]);
-        const v = u.searchParams.get("v");
-        const d = v
-          ? getVersionBody(id, Number(v))
-          : (() => {
-              const g = getDoc(id);
-              return g ? { title: g.title, body_md: g.body_md } : null;
-            })();
-        if (!d) return json(res, 404, { error: "not found" });
-        const name =
-          d.title.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "") || "note";
+        const g = getDoc(id);
+        if (!g) return json(res, 404, { error: "not found" });
+        const name = g.title.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "") || "note";
         res.writeHead(200, {
           "content-type": "text/markdown; charset=utf-8",
           "content-disposition": `attachment; filename="${name}.md"`,
         });
-        return res.end(d.body_md);
+        return res.end(g.body_md);
       }
 
       if (p === "/download/all") {
@@ -233,12 +283,20 @@ export function startUi(): { url: string; port: number } {
       res.writeHead(404);
       res.end("not found");
     } catch (e) {
-      res.writeHead(500);
-      res.end(String(e));
+      // Log detail to stderr only; never leak internals to the client.
+      process.stderr.write(`[brain-mcp ui] ${String(e)}\n`);
+      if (!res.headersSent) res.writeHead(500);
+      res.end("internal error");
     }
   });
 
+  // A busy port must not crash the whole MCP process.
+  server.on("error", (err) => {
+    process.stderr.write(`[brain-mcp ui] server error: ${String(err)}\n`);
+    started = false;
+  });
+
   server.listen(port, "127.0.0.1");
-  boundPort = port;
-  return { url: `http://127.0.0.1:${port}`, port };
+  started = true;
+  return { url: `http://127.0.0.1:${port}/?t=${TOKEN}`, port };
 }

@@ -8,6 +8,14 @@ clean notes and calls `brain_save`. Optional server-side restructuring is
 pluggable (host model via MCP sampling / an OpenAI-compatible endpoint / a local
 Ollama or LM Studio model).
 
+- **Private by default.** One local SQLite file (`~/.brain/brain.db`). No
+  telemetry, no account, no cloud unless you opt into a restructure engine.
+- **Secrets are stripped before write.** API keys, tokens, JWTs, private keys,
+  and credit-card numbers are redacted before anything touches disk.
+- **Cross-platform, no build step.** Uses Node's built-in SQLite (`node:sqlite`),
+  so the one-click bundle loads on macOS, Windows and Linux with no native
+  module to compile.
+
 ## Tools
 
 - `brain_save` — store a note (title, content, folder, tags); overwrite by id
@@ -20,11 +28,14 @@ Ollama or LM Studio model).
   `should_flush` once it crosses ~10 pages
 - `brain_flush` — restructure the whole buffer into one clean note and clear it
 - `brain_export` — zip of all notes (folder-structured .md + index + metadata)
+- `brain_import` — load notes back from a Brain export zip (or any zip of .md)
 - `brain_open_ui` — open the local web viewer/editor
 - `brain_system_check` — RAM/CPU report + recommended local model and setup
 
-Every note is also a resource (`brain://doc/<id>`) so the model can pull the
-knowledge base in as context without a tool call.
+All tools carry MCP annotations (`readOnlyHint`/`destructiveHint`) so the client
+shows the right confirmation gates. Every note is also a resource
+(`brain://doc/<id>`) so the model can pull the knowledge base in as context
+without a tool call.
 
 ## Auto-save after ~10 pages, and "save to brain"
 

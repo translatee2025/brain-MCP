@@ -1,8 +1,12 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+
+// Storage layer. Uses node:sqlite (Node's built-in SQLite, available in the
+// Node 22.5+/Electron runtime Claude Desktop ships). No native module, so the
+// one-click bundle loads on every platform without a compile step.
 
 export type DocRow = {
   id: string;
@@ -28,10 +32,25 @@ const BRAIN_DIR =
 
 mkdirSync(BRAIN_DIR, { recursive: true });
 
-const db = new Database(join(BRAIN_DIR, "brain.db"));
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-db.pragma("synchronous = NORMAL");
+export const DB_FILE = join(BRAIN_DIR, "brain.db");
+
+let db: DatabaseSync;
+try {
+  db = new DatabaseSync(DB_FILE);
+} catch (e) {
+  // Fail loud and actionable on stderr (stdout is reserved for the protocol).
+  process.stderr.write(
+    `[brain-mcp] failed to open database at ${DB_FILE}: ${String(e)}\n` +
+      `[brain-mcp] this runtime may lack node:sqlite (needs Node 22.5+). ` +
+      `Ensure the server is launched with a recent Node.\n`,
+  );
+  throw e;
+}
+
+db.exec("PRAGMA journal_mode = WAL");
+db.exec("PRAGMA foreign_keys = ON");
+db.exec("PRAGMA synchronous = NORMAL");
+db.exec("PRAGMA busy_timeout = 5000");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS docs (
@@ -85,7 +104,34 @@ CREATE TABLE IF NOT EXISTS capture_buffer (
 );
 `);
 
+// Lightweight migration stamp so a future schema change has a version to key
+// off. v0.1 baseline = 1. Add migrations as: if (userVersion < N) { ... }
+const userVersion =
+  (db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined)
+    ?.user_version ?? 0;
+if (userVersion < 1) db.exec("PRAGMA user_version = 1");
+
 const VERSION_KEEP = 20;
+
+// node:sqlite has no db.transaction() helper. Wrap a function so all its
+// writes commit or roll back atomically. Not reentrant; we never nest.
+function transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  return (...args: A): R => {
+    db.exec("BEGIN");
+    try {
+      const r = fn(...args);
+      db.exec("COMMIT");
+      return r;
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* ignore rollback failure */
+      }
+      throw e;
+    }
+  };
+}
 
 const stmt = {
   insertDoc: db.prepare(
@@ -129,6 +175,15 @@ const stmt = {
      WHERE fts MATCH ? AND d.deleted=0
      ORDER BY bm25(fts) LIMIT ?`,
   ),
+  // Folder-scoped variant filters in SQL (before LIMIT) so a folder search
+  // never silently under-returns.
+  ftsSearchFolder: db.prepare(
+    `SELECT f.doc_id AS id, d.title, d.folder, d.updated_at,
+            snippet(fts, 2, '[', ']', ' ... ', 12) AS snippet
+     FROM fts f JOIN docs d ON d.id=f.doc_id
+     WHERE fts MATCH ? AND d.deleted=0 AND d.folder=?
+     ORDER BY bm25(fts) LIMIT ?`,
+  ),
   nextVersion: db.prepare(
     `SELECT COALESCE(MAX(version_n), 0) + 1 AS n FROM doc_versions WHERE doc_id=?`,
   ),
@@ -143,8 +198,10 @@ const stmt = {
   getVersion: db.prepare(
     `SELECT title, body_md FROM doc_versions WHERE doc_id=? AND version_n=?`,
   ),
+  // Prune oldest versions beyond the keep window, but NEVER evict a user's
+  // hand-edit: that snapshot must always be recoverable.
   pruneVersions: db.prepare(
-    `DELETE FROM doc_versions WHERE doc_id=? AND version_n <=
+    `DELETE FROM doc_versions WHERE doc_id=? AND changed_by != 'user_edit' AND version_n <=
        (SELECT MAX(version_n) FROM doc_versions WHERE doc_id=?) - ?`,
   ),
   capAppend: db.prepare(
@@ -161,12 +218,7 @@ const stmt = {
   ),
 };
 
-function snapshot(
-  docId: string,
-  title: string,
-  body: string,
-  changedBy: string,
-) {
+function snapshot(docId: string, title: string, body: string, changedBy: string) {
   const n = (stmt.nextVersion.get(docId) as { n: number }).n;
   stmt.insertVersion.run({
     doc_id: docId,
@@ -199,7 +251,7 @@ function applyTags(docId: string, tags: string[]) {
   }
 }
 
-export const saveDoc = db.transaction(
+export const saveDoc = transaction(
   (input: {
     id?: string;
     title: string;
@@ -259,7 +311,7 @@ export function listVersions(docId: string): {
   }[];
 }
 
-export const restoreVersion = db.transaction(
+export const restoreVersion = transaction(
   (docId: string, versionN: number): boolean => {
     const v = stmt.getVersion.get(docId, versionN) as
       | { title: string; body_md: string }
@@ -267,6 +319,9 @@ export const restoreVersion = db.transaction(
     if (!v) return false;
     const cur = stmt.getDoc.get(docId) as DocRow | undefined;
     if (!cur) return false;
+    // Snapshot the CURRENT state first so the restore is genuinely
+    // non-destructive (matches the documented contract).
+    snapshot(docId, cur.title, cur.body_md, "pre-restore");
     stmt.updateDoc.run({
       id: docId,
       title: v.title,
@@ -291,11 +346,9 @@ export function getVersionBody(
   );
 }
 
-export const captureAppend = db.transaction(
-  (session: string, text: string): void => {
-    stmt.capAppend.run(session, session, text, Date.now());
-  },
-);
+export const captureAppend = transaction((session: string, text: string): void => {
+  stmt.capAppend.run(session, session, text, Date.now());
+});
 
 export function captureGet(session: string): string {
   return (stmt.capGet.all(session) as { text: string }[])
@@ -305,6 +358,10 @@ export function captureGet(session: string): string {
 
 export function captureClear(session: string): void {
   stmt.capClear.run(session);
+}
+
+export function tagsForDoc(docId: string): string[] {
+  return tagsFor(docId);
 }
 
 export function exportRows(): {
@@ -325,18 +382,16 @@ export function exportRows(): {
   }[];
 }
 
-export const DB_FILE = join(BRAIN_DIR, "brain.db");
-
 export function getDoc(id: string): (DocRow & { tags: string[] }) | null {
   const row = stmt.getDoc.get(id) as DocRow | undefined;
   if (!row) return null;
   return { ...row, tags: tagsFor(id) };
 }
 
-export const deleteDoc = db.transaction((id: string): boolean => {
+export const deleteDoc = transaction((id: string): boolean => {
   const res = stmt.softDelete.run(Date.now(), id);
   stmt.ftsDelete.run(id);
-  return res.changes > 0;
+  return Number(res.changes) > 0;
 });
 
 export function listDocs(folder: string | undefined, limit: number): DocSummary[] {
@@ -374,15 +429,19 @@ export function search(
 ): { id: string; title: string; folder: string; updated_at: number; snippet: string }[] {
   const match = sanitizeQuery(q);
   if (!match) return [];
-  const rows = stmt.ftsSearch.all(match, limit) as {
+  const f = folder?.trim();
+  const rows = (
+    f
+      ? stmt.ftsSearchFolder.all(match, f, limit)
+      : stmt.ftsSearch.all(match, limit)
+  ) as {
     id: string;
     title: string;
     folder: string;
     updated_at: number;
     snippet: string;
   }[];
-  const f = folder?.trim();
-  return f ? rows.filter((r) => r.folder === f) : rows;
+  return rows;
 }
 
 export { BRAIN_DIR };

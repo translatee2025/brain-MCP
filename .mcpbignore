@@ -1,0 +1,23 @@
+# Source and dev-only files: the bundle ships dist/ + prod node_modules.
+src/
+test/
+scripts/
+tsconfig.json
+.git/
+.gitignore
+.github/
+*.mcpb
+AUDIT.md
+HANDOFF.md
+DEMO-PROMPTS.md
+icon.svg
+node_modules/.bin/
+node_modules/typescript/
+node_modules/tsx/
+node_modules/@types/
+node_modules/fsevents/
+graphify-out/
+samples/*.md
+.serena/
+.claude/
+CLAUDE.md

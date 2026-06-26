@@ -25,22 +25,37 @@ function buildUserPrompt(title: string, raw: string): string {
 
 // Ask the host app's own model (Claude Desktop) to restructure, via MCP
 // sampling. Returns null if the host does not support sampling.
-async function viaSampling(
-  server: McpServer,
-  title: string,
-  raw: string,
-): Promise<string | null> {
+const TIMEOUT_MS = Number(process.env.BRAIN_LLM_TIMEOUT_MS ?? 120000);
+
+// Size the output budget to the input so restructuring of a long buffer is
+// not capped below what it needs (the old fixed 4000-token cap silently
+// dropped the back half of long conversations).
+function maxOutputTokens(raw: string): number {
+  const estIn = Math.ceil(raw.length / 4);
+  return Math.min(Math.max(estIn + 1000, 4000), 16000);
+}
+
+type EngineOut = { text: string; truncated: boolean } | null;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) => setTimeout(() => rej(new Error("restructure timed out")), ms)),
+  ]);
+}
+
+async function viaSampling(server: McpServer, title: string, raw: string): Promise<EngineOut> {
   try {
-    const result = await server.server.createMessage({
-      systemPrompt: SYSTEM_PROMPT,
-      maxTokens: 4000,
-      messages: [
-        {
-          role: "user",
-          content: { type: "text", text: buildUserPrompt(title, raw) },
-        },
-      ],
-    });
+    const result = await withTimeout(
+      server.server.createMessage({
+        systemPrompt: SYSTEM_PROMPT,
+        maxTokens: maxOutputTokens(raw),
+        messages: [
+          { role: "user", content: { type: "text", text: buildUserPrompt(title, raw) } },
+        ],
+      }),
+      TIMEOUT_MS,
+    );
     const c = result.content as
       | { type: string; text?: string }
       | { type: string; text?: string }[];
@@ -49,7 +64,9 @@ async function viaSampling(
       .map((b) => (b.type === "text" ? (b.text ?? "") : ""))
       .join("")
       .trim();
-    return text.length > 0 ? text : null;
+    if (text.length === 0) return null;
+    const truncated = (result as { stopReason?: string }).stopReason === "maxTokens";
+    return { text, truncated };
   } catch {
     return null;
   }
@@ -57,7 +74,7 @@ async function viaSampling(
 
 // OpenAI-compatible endpoint: real OpenAI/ChatGPT, or a local Ollama
 // (http://127.0.0.1:11434/v1) / LM Studio (http://127.0.0.1:1234/v1).
-async function viaOpenAI(title: string, raw: string): Promise<string | null> {
+async function viaOpenAI(title: string, raw: string): Promise<EngineOut> {
   const base = (process.env.BRAIN_LLM_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const key = process.env.BRAIN_LLM_API_KEY ?? "";
   const model = process.env.BRAIN_LLM_MODEL ?? "gpt-4o-mini";
@@ -71,39 +88,44 @@ async function viaOpenAI(title: string, raw: string): Promise<string | null> {
       body: JSON.stringify({
         model,
         temperature: 0.2,
+        max_tokens: maxOutputTokens(raw),
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: buildUserPrompt(title, raw) },
         ],
       }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
     };
     const text = data.choices?.[0]?.message?.content?.trim();
-    return text && text.length > 0 ? text : null;
+    if (!text || text.length === 0) return null;
+    const truncated = data.choices?.[0]?.finish_reason === "length";
+    return { text, truncated };
   } catch {
     return null;
   }
 }
 
-// Restructure with graceful degradation: if the configured engine is
-// unavailable, the raw content is stored as-is (never lose the note).
+// Restructure with graceful degradation. Two guarantees:
+// 1. If the engine is unavailable, store the raw text verbatim (never lose a note).
+// 2. If the engine SUCCEEDS but truncates its output, fall back to verbatim raw
+//    too: a partial note is data loss, the full buffer is not. The caller can
+//    surface that it was stored verbatim.
 export async function restructure(
   server: McpServer,
   title: string,
   raw: string,
   override?: RestructureMode,
-): Promise<{ body: string; engine: RestructureMode | "raw" }> {
+): Promise<{ body: string; engine: RestructureMode | "raw"; truncated: boolean }> {
   const mode = override ?? configuredMode();
-  if (mode === "none") return { body: raw, engine: "raw" };
-  if (mode === "openai") {
-    const out = await viaOpenAI(title, raw);
-    return out ? { body: out, engine: "openai" } : { body: raw, engine: "raw" };
-  }
-  const out = await viaSampling(server, title, raw);
-  return out ? { body: out, engine: "sampling" } : { body: raw, engine: "raw" };
+  if (mode === "none") return { body: raw, engine: "raw", truncated: false };
+  const out = mode === "openai" ? await viaOpenAI(title, raw) : await viaSampling(server, title, raw);
+  if (!out) return { body: raw, engine: "raw", truncated: false };
+  if (out.truncated) return { body: raw, engine: "raw", truncated: true };
+  return { body: out.text, engine: mode, truncated: false };
 }
 
 // Inspect the machine and recommend a local model the user can pull,

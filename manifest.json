@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "brain-mcp",
   "display_name": "Brain",
-  "version": "0.1.0",
-  "description": "A private local long-term memory for Claude. Save, search, version and browse clean markdown notes in your own SQLite store; never leaves your Mac unless you opt in.",
-  "long_description": "Brain gives Claude a persistent personal knowledge base that lives entirely on your machine. Claude writes clean notes (manually with 'save to brain' or automatically once a conversation crosses ~10 pages), stores them in a local SQLite database with FTS5 full-text search, keeps version history, and exposes a localhost web UI so you can browse, edit and export your notes as markdown. No telemetry, no cloud, no account. Optional restructuring engines (host model via MCP sampling, or any OpenAI-compatible endpoint including local Ollama) can be enabled per-user.",
+  "version": "0.2.0",
+  "description": "A private local long-term memory for Claude. Save, search, version and browse clean markdown notes in your own SQLite store; never leaves your computer unless you opt in.",
+  "long_description": "Brain gives Claude a persistent personal knowledge base that lives entirely on your machine. Claude writes clean notes (manually with 'save to brain' or automatically once a conversation crosses about ten pages), stores them in a local SQLite database with full-text search, keeps version history, and exposes a localhost web UI so you can browse, edit, restore and export your notes as markdown. Secrets (API keys, tokens, private keys) are stripped before anything is written. No telemetry, no cloud, no account. Optional restructuring engines (host model via MCP sampling, or any OpenAI-compatible endpoint including a local Ollama) can be enabled per-user. Uses Node's built-in SQLite, so the one-click install loads on macOS, Windows and Linux with no native build step.",
   "author": {
     "name": "translatee2025",
     "url": "https://github.com/translatee2025"
@@ -33,15 +33,15 @@
     "https://github.com/translatee2025/brain-MCP/blob/main/PRIVACY.md"
   ],
   "compatibility": {
-    "platforms": ["darwin"],
-    "runtimes": { "node": ">=20.0.0" }
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=22.5.0" }
   },
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/dist/index.js"],
+      "args": ["--experimental-sqlite", "${__dirname}/dist/index.js"],
       "env": {
         "BRAIN_DIR": "${user_config.brain_dir}",
         "BRAIN_RESTRUCTURE": "${user_config.restructure_mode}",
@@ -54,18 +54,19 @@
     }
   },
   "tools": [
-    { "name": "brain_save", "description": "Save a clean markdown note to long-term memory with a title, optional folder and tags." },
-    { "name": "brain_search", "description": "Full-text search (SQLite FTS5, bm25 ranked) across saved notes, returns highlighted snippets." },
-    { "name": "brain_get", "description": "Fetch one note in full by its id, including title, folder, tags and full body." },
-    { "name": "brain_list", "description": "List recent notes with folder counts; optionally filter by folder." },
-    { "name": "brain_delete", "description": "Soft-delete a note by id; kept in the database but dropped from search and listings." },
-    { "name": "brain_versions", "description": "List the version history of a note, newest first." },
-    { "name": "brain_restore", "description": "Restore a note to an earlier version; the current state is snapshotted first so nothing is lost." },
-    { "name": "brain_capture", "description": "Append the latest exchange to a per-session running buffer and report a token estimate; signals should_flush=true once the buffer crosses the auto-save threshold." },
-    { "name": "brain_flush", "description": "Restructure the running buffer into one clean note, save it, and clear the buffer. Use when the user says 'save to brain' or capture reports should_flush." },
-    { "name": "brain_export", "description": "Export the whole brain as a zip with folder-structured markdown files plus an index and metadata." },
-    { "name": "brain_open_ui", "description": "Open the local web viewer in the default browser to browse, read, edit, restore versions of, and download notes." },
-    { "name": "brain_system_check", "description": "Report this machine's RAM and CPU and recommend a local model plus exact setup steps for offline restructuring." }
+    { "name": "brain_save", "description": "Save a markdown note to long-term memory with a title, optional folder, and tags." },
+    { "name": "brain_search", "description": "Full-text search across saved notes; returns ids, titles, and snippets." },
+    { "name": "brain_get", "description": "Fetch one note in full by id." },
+    { "name": "brain_list", "description": "List recent notes with per-folder counts." },
+    { "name": "brain_delete", "description": "Soft-delete a note by id." },
+    { "name": "brain_versions", "description": "List the version history of a note." },
+    { "name": "brain_restore", "description": "Restore a note to an earlier version (non-destructive)." },
+    { "name": "brain_capture", "description": "Append the latest exchange to a per-session buffer for later saving." },
+    { "name": "brain_flush", "description": "Restructure the running buffer into one note, save it, and clear the buffer." },
+    { "name": "brain_export", "description": "Export all notes to a zip of folder-structured markdown." },
+    { "name": "brain_import", "description": "Import notes from a Brain export zip or any zip of markdown files." },
+    { "name": "brain_open_ui", "description": "Open the local web viewer to browse, edit, restore, and download notes." },
+    { "name": "brain_system_check", "description": "Report RAM/CPU and recommend a local model and setup for offline restructuring." }
   ],
   "user_config": {
     "restructure_mode": {
